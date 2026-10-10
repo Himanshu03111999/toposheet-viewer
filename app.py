@@ -41,38 +41,48 @@ CRS_4326 = "EPSG:4326"
 CRS_METRIC = "EPSG:3857"
 
 # ---------------------------------------------------------
-# 2. Page Config & CSS Styling
+# 2. Page Config & Custom CSS Styling
 # ---------------------------------------------------------
 st.set_page_config(page_title="Toposheet Viewer and Map Exporter", layout="wide")
 
 st.markdown("""
     <style>
-    /* Prevent cut-off at top */
+    /* Hide top header bar overlay that causes title clipping */
+    header[data-testid="stHeader"], .stAppHeader {
+        background-color: transparent !important;
+        height: 0px !important;
+        min-height: 0px !important;
+        display: none !important;
+    }
+
+    /* Padding to accommodate larger title cleanly */
     .block-container {
-        padding-top: 1.8rem !important;
+        padding-top: 2.5rem !important;
         padding-bottom: 0.5rem !important;
         padding-left: 1.5rem !important;
         padding-right: 1.5rem !important;
         overflow: visible !important;
     }
 
-    /* Large Header Title */
-    .big-main-header {
-        font-size: 30px !important;
+    /* Large title increased by +2 size steps */
+    .big-main-title {
+        font-size: 38px !important;
         font-weight: 800 !important;
-        color: #1a1a1a !important;
+        color: #111111 !important;
         margin-top: 0px !important;
-        margin-bottom: 0.5rem !important;
-        line-height: 1.2 !important;
+        margin-bottom: 0.6rem !important;
+        padding-top: 0px !important;
+        line-height: 1.25 !important;
         display: block !important;
+        overflow: visible !important;
     }
 
-    /* Compact sizing */
+    /* General font sizing */
     html, body, [class*="css"], .stMarkdown, p, span, label {
         font-size: 12px !important;
     }
 
-    /* Prevent UI grayout */
+    /* Disable UI grayout during reruns */
     .stApp, [data-testid="stAppViewContainer"], .stMainBlockContainer {
         opacity: 1 !important;
         transition: none !important;
@@ -82,7 +92,7 @@ st.markdown("""
         opacity: 1 !important;
     }
 
-    /* Hide 'No results' popup overlay */
+    /* Hide 'No results' dropdown box */
     div[data-baseweb="popover"]:has(div:contains("No results")) {
         display: none !important;
     }
@@ -120,7 +130,7 @@ def get_secret(key, default_val=""):
         pass
     return os.environ.get(key, default_val)
 
-HF_TOKEN = get_secret("HF_TOKEN", "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")
+HF_TOKEN = get_secret("HF_TOKEN", "")
 HF_REPO_ID = get_secret("HF_REPO_ID", "himanshuguptta/geotiff-hub")
 
 @st.cache_resource
@@ -407,7 +417,8 @@ if uploaded_vector is not None:
 # 7. Dashboard Layout
 # ---------------------------------------------------------
 
-st.markdown('<div class="big-main-header">🌐 Toposheet Viewer and Map Exporter</div>', unsafe_allow_html=True)
+# Title rendering (+2 size steps: 38px)
+st.markdown('<div class="big-main-title">🌐 Toposheet Viewer and Map Exporter</div>', unsafe_allow_html=True)
 
 project_title = st.text_input(
     "Project Title",
@@ -517,7 +528,7 @@ with col_legend:
 
 st.markdown("---")
 
-# --- EXPORT SECTION DIRECTLY BELOW MAP ---
+# --- EXPORT SECTION ---
 col_lbl, col_dpi, col_btn = st.columns([1.2, 1.5, 3])
 
 with col_lbl:
@@ -534,7 +545,6 @@ with col_btn:
                 project_title, toposheet_str, dpi=export_dpi
             )
 
-# Download button appears cleanly below when ready
 if "generated_map_bytes" in st.session_state and st.session_state["generated_map_bytes"] is not None:
     st.download_button(
         label="⬇️ Download Ready High-Res Map (PNG)",
