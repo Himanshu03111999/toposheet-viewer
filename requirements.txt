@@ -1,0 +1,10 @@
+streamlit
+streamlit-folium
+folium
+geopandas
+rasterio
+pyproj
+numpy
+matplotlib
+pillow
+huggingface_hub
