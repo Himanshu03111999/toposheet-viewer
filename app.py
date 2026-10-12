@@ -1,583 +1,340 @@
-import os
-import sys
-import re
-import tempfile
-import zipfile
-import io
-import textwrap
+import os, re, io, json, zipfile, tempfile, textwrap, threading, math
+from functools import lru_cache
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# ---------------------------------------------------------
-# 1. Environment & PROJ Setup
-# ---------------------------------------------------------
-VENV_PATH = r"C:\Users\Syste\AppData\Local\Programs\Python\Python312\tree_env"
-PROJ_DIR = os.path.join(VENV_PATH, "Lib", "site-packages", "pyproj", "proj_dir", "share", "proj")
-
-if os.path.exists(os.path.join(PROJ_DIR, "proj.db")):
-    os.environ["PROJ_LIB"] = PROJ_DIR
-    os.environ["GDAL_DATA"] = os.path.dirname(PROJ_DIR)
-
-import pyproj
-try:
-    if os.path.exists(PROJ_DIR):
-        pyproj.datadir.set_data_dir(PROJ_DIR)
-except Exception:
-    pass
-
+import requests
 import streamlit as st
-import folium
 import geopandas as gpd
-import rasterio
-from rasterio.warp import calculate_default_transform, reproject
-from rasterio.enums import Resampling
-import numpy as np
+import streamlit.components.v1 as components
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.patches import Rectangle
+from matplotlib.ticker import FuncFormatter
 from PIL import Image
-from huggingface_hub import HfApi, hf_hub_download, list_repo_files
-from streamlit_folium import st_folium
+from pmtiles.reader import Reader
 
-CRS_4326 = "EPSG:4326"
-CRS_METRIC = "EPSG:3857"
+Image.MAX_IMAGE_PIXELS = None
+GITHUB_USER, GITHUB_REPO, RELEASE_TAG = "Himanshu03111999", "toposheet-storage", "v1.0.0"
+PROXY_PORT = 8765
+API = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}"
+R = 6378137.0
 
-# ---------------------------------------------------------
-# 2. Page Config & Custom CSS Styling
-# ---------------------------------------------------------
+TOKEN = os.getenv("GITHUB_TOKEN")
+if not TOKEN:
+    try:
+        TOKEN = st.secrets.get("GITHUB_TOKEN")
+    except Exception:
+        TOKEN = None
+AUTH = {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
+
 st.set_page_config(page_title="Toposheet Viewer and Map Exporter", layout="wide")
-
 st.markdown("""
-    <style>
-    /* Hide top header bar overlay that causes title clipping */
-    header[data-testid="stHeader"], .stAppHeader {
-        background-color: transparent !important;
-        height: 0px !important;
-        min-height: 0px !important;
-        display: none !important;
-    }
-
-    /* Padding to accommodate larger title cleanly */
-    .block-container {
-        padding-top: 2.5rem !important;
-        padding-bottom: 0.5rem !important;
-        padding-left: 1.5rem !important;
-        padding-right: 1.5rem !important;
-        overflow: visible !important;
-    }
-
-    /* Large title increased by +2 size steps */
-    .big-main-title {
-        font-size: 38px !important;
-        font-weight: 800 !important;
-        color: #111111 !important;
-        margin-top: 0px !important;
-        margin-bottom: 0.6rem !important;
-        padding-top: 0px !important;
-        line-height: 1.25 !important;
-        display: block !important;
-        overflow: visible !important;
-    }
-
-    /* General font sizing */
-    html, body, [class*="css"], .stMarkdown, p, span, label {
-        font-size: 12px !important;
-    }
-
-    /* Disable UI grayout during reruns */
-    .stApp, [data-testid="stAppViewContainer"], .stMainBlockContainer {
-        opacity: 1 !important;
-        transition: none !important;
-        filter: none !important;
-    }
-    div[data-st-mode="running"] {
-        opacity: 1 !important;
-    }
-
-    /* Hide 'No results' dropdown box */
-    div[data-baseweb="popover"]:has(div:contains("No results")) {
-        display: none !important;
-    }
-
-    .stTextInput > div > div > input {
-        font-size: 12px !important;
-        padding: 4px 8px !important;
-    }
-    .stSelectbox > div > div {
-        font-size: 12px !important;
-    }
-    .stButton > button {
-        font-size: 12px !important;
-        padding: 6px 12px !important;
-        font-weight: 600 !important;
-    }
-
-    [data-testid="stStatusWidget"] {
-        visibility: hidden !important;
-        display: none !important;
-    }
-
-    hr {
-        margin: 0.4rem 0 !important;
-    }
-    </style>
+<style>
+header[data-testid="stHeader"]{display:none!important}
+.block-container{padding:2.5rem 1.5rem .5rem!important}
+.big-main-title{font-size:38px;font-weight:800;line-height:1.25;margin-bottom:.6rem}
+html,body,[class*="css"],.stMarkdown,p,span,label{font-size:12px!important}
+.stApp,[data-testid="stAppViewContainer"]{opacity:1!important;transition:none!important}
+[data-testid="stStatusWidget"]{display:none!important}
+.stButton>button{font-size:12px!important;font-weight:600!important}
+hr{margin:.4rem 0!important}
+.custom-footer{text-align:center;color:#888;font-size:10px;padding:4px 0;border-top:1px solid #e0e0e0;margin-top:10px}
+.custom-footer a{color:#06c;text-decoration:none}
+</style>
+<div class="big-main-title">🌐 Toposheet Viewer and Map Exporter</div>
 """, unsafe_allow_html=True)
 
-# Secrets Setup
-def get_secret(key, default_val=""):
-    try:
-        if key in st.secrets:
-            return st.secrets[key]
-    except Exception:
-        pass
-    return os.environ.get(key, default_val)
+# ---------------- GitHub assets + range proxy ----------------
+@st.cache_data(ttl=300)
+def release_assets():
+    r = requests.get(f"{API}/releases/tags/{RELEASE_TAG}",
+                     headers={"Accept": "application/vnd.github+json", **AUTH}, timeout=30)
+    r.raise_for_status()
+    return {a["name"]: str(a["id"]) for a in r.json()["assets"]}
 
-HF_TOKEN = get_secret("HF_TOKEN", "")
-HF_REPO_ID = get_secret("HF_REPO_ID", "himanshuguptta/geotiff-hub")
+@lru_cache(maxsize=2048)
+def fetch_range(asset_id, rng=None):
+    h = {"Accept": "application/octet-stream", **AUTH}
+    if rng:
+        h["Range"] = rng
+    r = requests.get(f"{API}/releases/assets/{asset_id}", headers=h, timeout=60)
+    return r.status_code, r.headers.get("Content-Range"), r.content
 
-@st.cache_resource
-def get_hf_api():
-    return HfApi(token=HF_TOKEN)
+class Proxy(BaseHTTPRequestHandler):
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Range")
+        self.send_header("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges")
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_legend_image_path():
-    remote_path = "shared_rasters/legend_topsheet.png"
-    try:
-        path = hf_hub_download(
-            repo_id=HF_REPO_ID,
-            filename=remote_path,
-            repo_type="dataset",
-            token=HF_TOKEN
-        )
-        return path
-    except Exception:
-        return None
+    def do_OPTIONS(self):
+        self.send_response(204); self._cors(); self.end_headers()
 
-# ---------------------------------------------------------
-# 3. Filename & Processing Engine
-# ---------------------------------------------------------
-def extract_toposheet_from_filename(filename):
-    pattern = r'(\d{1,3}[A-P]/?\d{1,2})'
-    matches = re.findall(pattern, filename, re.IGNORECASE)
-    if matches:
-        match = matches[0].upper()
-        if '/' not in match:
-            match = re.sub(r'([A-P])(\d+)', r'\1/\2', match)
-        return match
-    return None
-
-def list_hf_geotiffs():
-    try:
-        api = get_hf_api()
-        files = list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN)
-        return [f.replace("shared_rasters/", "") for f in files if f.startswith("shared_rasters/") and f.endswith(('.tif', '.tiff'))]
-    except Exception:
-        return []
-
-def process_raster_file(src_raster, max_dim=800):
-    scale = min(1.0, max_dim / max(src_raster.width, src_raster.height))
-    dst_width = max(1, int(src_raster.width * scale))
-    dst_height = max(1, int(src_raster.height * scale))
-
-    if src_raster.crs != CRS_4326:
-        transform, width, height = calculate_default_transform(
-            src_raster.crs, CRS_4326, src_raster.width, src_raster.height, *src_raster.bounds,
-            dst_width=dst_width, dst_height=dst_height
-        )
-        num_bands = min(src_raster.count, 3)
-        reprojected_bands = []
-        for b in range(1, num_bands + 1):
-            destination = np.zeros((dst_height, dst_width), dtype=src_raster.dtypes[0])
-            reproject(
-                source=rasterio.band(src_raster, b),
-                destination=destination,
-                src_transform=src_raster.transform,
-                src_crs=src_raster.crs,
-                dst_transform=transform,
-                dst_crs=CRS_4326,
-                resampling=Resampling.bilinear
-            )
-            reprojected_bands.append(destination)
-        bounds = rasterio.transform.array_bounds(dst_height, dst_width, transform)
-        rgb = np.stack(reprojected_bands[:3], axis=-1) if len(reprojected_bands) >= 3 else np.stack([reprojected_bands[0]]*3, axis=-1)
-    else:
-        bounds = src_raster.bounds
-        out_shape = (src_raster.count, dst_height, dst_width)
-        data = src_raster.read(out_shape=out_shape, resampling=Resampling.bilinear)
-        rgb = np.stack([data[0], data[1], data[2]], axis=-1) if src_raster.count >= 3 else np.stack([data[0]]*3, axis=-1)
-
-    rgb = np.nan_to_num(rgb, nan=0.0)
-    p_min, p_max = np.percentile(rgb, (2, 98))
-    if p_max == p_min:
-        p_max += 1e-5
-    rgb_scaled = np.clip((rgb - p_min) / (p_max - p_min) * 255, 0, 255).astype(np.uint8)
-    bbox_4326 = [bounds[0], bounds[1], bounds[2], bounds[3]]
-
-    return rgb_scaled, bbox_4326
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def process_cloud_geotiff_cached(filename, max_dim=800):
-    try:
-        remote_path = f"shared_rasters/{filename}"
-        local_path = hf_hub_download(
-            repo_id=HF_REPO_ID,
-            filename=remote_path,
-            repo_type="dataset",
-            token=HF_TOKEN
-        )
-        with rasterio.open(local_path) as src:
-            rgb_scaled, bbox_4326 = process_raster_file(src, max_dim=max_dim)
-        return rgb_scaled, bbox_4326, local_path
-    except Exception:
-        return None, None, None
-
-def process_local_raster(uploaded_file, max_dim=800):
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".tif") as tmp:
-            tmp.write(uploaded_file.getbuffer())
-            tmp_path = tmp.name
-
-        with rasterio.open(tmp_path) as src:
-            rgb_scaled, bbox_4326 = process_raster_file(src, max_dim=max_dim)
-        
-        return rgb_scaled, bbox_4326, tmp_path
-    except Exception:
-        return None, None, None
-
-# ---------------------------------------------------------
-# 4. Vector & Buffer Engine
-# ---------------------------------------------------------
-def process_uploaded_vector(uploaded_file):
-    filename = uploaded_file.name.lower()
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        file_path = os.path.join(tmp_dir, uploaded_file.name)
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        if filename.endswith(".zip"):
-            with zipfile.ZipFile(file_path, "r") as zip_ref:
-                zip_ref.extractall(tmp_dir)
-            shp_files = [f for f in os.listdir(tmp_dir) if f.endswith(".shp")]
-            if shp_files:
-                gdf = gpd.read_file(os.path.join(tmp_dir, shp_files[0]))
-            else:
-                return None
-        else:
-            gdf = gpd.read_file(file_path)
-
-        if gdf.crs is None:
-            gdf = gdf.set_crs(CRS_4326)
-        else:
-            gdf = gdf.to_crs(CRS_4326)
-        return gdf
-
-def create_buffers(gdf):
-    if gdf is None:
-        return None, None, None
-    gdf_metric = gdf.to_crs(CRS_METRIC)
-    buf_2km = gdf_metric.buffer(2000).to_crs(CRS_4326)
-    buf_5km = gdf_metric.buffer(5000).to_crs(CRS_4326)
-    buf_10km = gdf_metric.buffer(10000).to_crs(CRS_4326)
-    return buf_2km, buf_5km, buf_10km
-
-# ---------------------------------------------------------
-# 5. High-Res Export Engine
-# ---------------------------------------------------------
-def export_high_res_map(selected_cloud_rasters, local_raster_files, gdf_site, buf_2km, buf_5km, buf_10km, project_title, toposheet_str, dpi=800):
-    fig = plt.figure(figsize=(16, 11), dpi=dpi)
-    gs = gridspec.GridSpec(1, 2, width_ratios=[3.6, 1.2], wspace=0.012)
-
-    ax_map = plt.subplot(gs[0])
-
-    for r_name in selected_cloud_rasters:
-        rgb_img, bbox, _ = process_cloud_geotiff_cached(r_name, max_dim=2400)
-        if rgb_img is not None:
-            ax_map.imshow(rgb_img, extent=[bbox[0], bbox[2], bbox[1], bbox[3]], origin='upper')
-
-    for file_obj in local_raster_files:
-        rgb_img, bbox, _ = process_local_raster(file_obj, max_dim=2400)
-        if rgb_img is not None:
-            ax_map.imshow(rgb_img, extent=[bbox[0], bbox[2], bbox[1], bbox[3]], origin='upper')
-
-    if gdf_site is not None:
-        gpd.GeoSeries(buf_10km).plot(ax=ax_map, facecolor='none', edgecolor='#333333', linestyle='--', linewidth=1.2)
-        gpd.GeoSeries(buf_5km).plot(ax=ax_map, facecolor='none', edgecolor='#000000', linestyle='--', linewidth=1.5)
-        gpd.GeoSeries(buf_2km).plot(ax=ax_map, facecolor='none', edgecolor='#000000', linestyle=':', linewidth=1.8)
-        gdf_site.plot(ax=ax_map, facecolor='none', edgecolor='#000000', linewidth=2.0)
-
-        bounds_10 = buf_10km.total_bounds
-        dx = (bounds_10[2] - bounds_10[0]) * 0.15
-        dy = (bounds_10[3] - bounds_10[1]) * 0.15
-        ax_map.set_xlim([bounds_10[0] - dx, bounds_10[2] + dx])
-        ax_map.set_ylim([bounds_10[1] - dy, bounds_10[3] + dy])
-
-    ax_map.set_title("Topographic MAP", fontsize=22, fontweight='bold', pad=12)
-    ax_map.grid(True, linestyle=':', alpha=0.5)
-
-    ax_side = plt.subplot(gs[1])
-    ax_side.set_xlim([0, 1])
-    ax_side.set_ylim([0, 1])
-    ax_side.axis('off')
-
-    rect = Rectangle((0, 0), 1, 1, fill=False, edgecolor='black', linewidth=1.5, transform=ax_side.transAxes)
-    ax_side.add_patch(rect)
-
-    scale_y = 0.945
-    ax_side.plot([0.08, 0.45], [scale_y, scale_y], color='black', lw=1.5)
-    for t in [0.08, 0.265, 0.45]:
-        ax_side.plot([t, t], [scale_y, scale_y + 0.012], color='black', lw=1.5)
-    
-    ax_side.text(0.08, scale_y + 0.015, "0", fontsize=8.5, fontweight='bold', ha='center', va='bottom')
-    ax_side.text(0.265, scale_y + 0.015, "1", fontsize=8.5, fontweight='bold', ha='center', va='bottom')
-    ax_side.text(0.45, scale_y + 0.015, "2 km", fontsize=8.5, fontweight='bold', ha='center', va='bottom')
-
-    ax_side.text(0.80, 0.965, "N", fontsize=18, fontweight='bold', ha='center', va='center')
-    ax_side.text(0.80, 0.930, "▲", fontsize=28, ha='center', va='center')
-
-    ax_side.plot([0, 1], [0.905, 0.905], color='black', lw=1)
-
-    ax_side.text(0.5, 0.880, "Title :", fontsize=11.5, fontweight='bold', ha='center', va='center')
-    wrapped_lines = textwrap.wrap(project_title.replace('\n', ' '), width=26)
-    formatted_title = "\n".join(wrapped_lines)
-    ax_side.text(0.5, 0.815, formatted_title, fontsize=10.0, fontweight='medium', ha='center', va='center', clip_on=True, linespacing=1.2)
-
-    ax_side.plot([0, 1], [0.740, 0.740], color='black', lw=1)
-
-    ax_side.text(0.5, 0.715, "Legends", fontsize=10.5, fontweight='bold', ha='center', va='center')
-    ax_side.add_patch(Rectangle((0.08, 0.672), 0.12, 0.022, fill=False, edgecolor='black', lw=1.8))
-    ax_side.text(0.25, 0.683, "Project Site", fontsize=8.5, va='center')
-
-    ax_side.add_patch(Rectangle((0.08, 0.637), 0.12, 0.022, fill=False, edgecolor='black', linestyle=':', lw=1.8))
-    ax_side.text(0.25, 0.648, "Core Zone : 2 km", fontsize=8.5, va='center')
-
-    ax_side.add_patch(Rectangle((0.08, 0.602), 0.12, 0.022, fill=False, edgecolor='black', linestyle='--', lw=1.5))
-    ax_side.text(0.25, 0.613, "Buffer Zone 5 km", fontsize=8.5, va='center')
-
-    ax_side.add_patch(Rectangle((0.08, 0.567), 0.12, 0.022, fill=False, edgecolor='#333333', linestyle='--', lw=1.2))
-    ax_side.text(0.25, 0.578, "Buffer Zone 10 km", fontsize=8.5, va='center')
-
-    ax_side.plot([0, 1], [0.545, 0.545], color='black', lw=1)
-
-    legend_img_path = get_legend_image_path()
-    if legend_img_path and os.path.exists(legend_img_path):
+    def do_GET(self):
         try:
-            leg_img = Image.open(legend_img_path)
-            ax_img = ax_side.inset_axes([0.005, 0.005, 0.990, 0.535])
-            ax_img.imshow(leg_img, aspect='auto')
-            ax_img.axis('off')
+            code, cr, body = fetch_range(self.path.strip("/").split("/")[-1], self.headers.get("Range"))
+            self.send_response(code)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(len(body)))
+            if cr:
+                self.send_header("Content-Range", cr)
+            self._cors(); self.end_headers(); self.wfile.write(body)
         except Exception:
             pass
 
-    fig.text(0.15, 0.02, "Source : Survey of India", fontsize=12, fontweight='bold')
-    fig.text(0.42, 0.02, f"Topo sheet No. {toposheet_str}", fontsize=12, fontweight='bold')
-
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=dpi, bbox_inches='tight')
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-# ---------------------------------------------------------
-# 6. Sidebar Controls
-# ---------------------------------------------------------
-st.sidebar.header("⚙️ Data Inputs")
-
-selected_basemap = st.sidebar.selectbox(
-    "🗺️ Choose Base Map",
-    ["OpenStreetMap", "Google Satellite", "Google Hybrid", "Google Roadmap", "Esri Satellite"]
-)
-
-uploaded_rasters = st.sidebar.file_uploader(
-    "Upload Raster GeoTIFF", 
-    type=["tif", "tiff"], 
-    accept_multiple_files=True
-)
-
-shared_geotiffs = list_hf_geotiffs()
-
-selected_cloud_rasters = st.sidebar.multiselect(
-    "Cloud Rasters",
-    options=shared_geotiffs,
-    default=[]
-)
-
-RASTER_OPACITY = 0.85
-
-uploaded_vector = st.sidebar.file_uploader("Upload Vector (.geojson, .kml, .zip)", type=["geojson", "kml", "gpx", "zip"])
-
-gdf_site, buf_2km, buf_5km, buf_10km = None, None, None, None
-if uploaded_vector is not None:
-    try:
-        gdf_site = process_uploaded_vector(uploaded_vector)
-        if gdf_site is not None:
-            buf_2km, buf_5km, buf_10km = create_buffers(gdf_site)
-            st.sidebar.caption("✅ Vectors Loaded")
-    except Exception:
+    def log_message(self, *a):
         pass
 
-# ---------------------------------------------------------
-# 7. Dashboard Layout
-# ---------------------------------------------------------
+@st.cache_resource
+def start_proxy():
+    srv = ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), Proxy)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
 
-# Title rendering (+2 size steps: 38px)
-st.markdown('<div class="big-main-title">🌐 Toposheet Viewer and Map Exporter</div>', unsafe_allow_html=True)
+start_proxy()
 
+def legend_image(assets):
+    if "legend_topsheet.png" in assets:
+        code, _, body = fetch_range(assets["legend_topsheet.png"], None)
+        if code == 200:
+            return body
+    return None
+
+# ---------------- Vector + buffers ----------------
+def load_vector(f):
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, f.name)
+        open(p, "wb").write(f.getbuffer())
+        if f.name.lower().endswith(".zip"):
+            zipfile.ZipFile(p).extractall(d)
+            p = next((os.path.join(d, x) for x in os.listdir(d) if x.endswith(".shp")), None)
+            if not p:
+                return None
+        g = gpd.read_file(p)
+    return g.set_crs(4326) if g.crs is None else g.to_crs(4326)
+
+def sheet_no(name):
+    s = re.findall(r"\d{1,3}[A-P]/?\d{1,2}", name, re.I)
+    if not s:
+        return None
+    s = s[0].upper()
+    return s if "/" in s else re.sub(r"([A-P])(\d+)", r"\1/\2", s)
+
+# ---------------- High-res export (stitches PMTiles tiles) ----------------
+def mosaic(asset_id, bounds, max_tiles=12):
+    rd = Reader(lambda o, l: fetch_range(asset_id, f"bytes={o}-{o + l - 1}")[2])
+    h = rd.header()
+    z = h["max_zoom"]
+
+    def rng(z):
+        n = 2 ** z
+        tx = lambda lon: int((lon + 180) / 360 * n)
+        ty = lambda lat: int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n)
+        x0, x1 = sorted((tx(bounds[0]), tx(bounds[2])))
+        y0, y1 = sorted((ty(bounds[1]), ty(bounds[3])))
+        return n, max(x0, 0), min(x1, n - 1), max(y0, 0), min(y1, n - 1)
+
+    n, x0, x1, y0, y1 = rng(z)
+    while z > h["min_zoom"] and (x1 - x0 + 1 > max_tiles or y1 - y0 + 1 > max_tiles):
+        z -= 1
+        n, x0, x1, y0, y1 = rng(z)
+
+    canvas = Image.new("RGBA", ((x1 - x0 + 1) * 256, (y1 - y0 + 1) * 256), (0, 0, 0, 0))
+    for x in range(x0, x1 + 1):
+        for y in range(y0, y1 + 1):
+            data = rd.get(z, x, y)
+            if data:
+                t = Image.open(io.BytesIO(data)).convert("RGBA").resize((256, 256))
+                canvas.alpha_composite(t, ((x - x0) * 256, (y - y0) * 256))
+    ts = 2 * math.pi * R / n
+    ext = [-math.pi * R + x0 * ts, -math.pi * R + (x1 + 1) * ts,
+           math.pi * R - (y1 + 1) * ts, math.pi * R - y0 * ts]
+    return canvas, ext
+
+def export_map(sheets_pm, site, title, sheets_str, dpi, legend_bytes):
+    fig = plt.figure(figsize=(16, 11), dpi=dpi)
+    gs = gridspec.GridSpec(1, 2, width_ratios=[3.6, 1.2], wspace=0.012)
+    ax = plt.subplot(gs[0])
+
+    if site is not None:
+        s = site.to_crs(3857)
+        bufs = {km: s.buffer(km * 1000) for km in (10, 5, 2)}
+        b = bufs[10].total_bounds
+        dx, dy = (b[2] - b[0]) * .15, (b[3] - b[1]) * .15
+        view = [b[0] - dx, b[2] + dx, b[1] - dy, b[3] + dy]
+        ll = gpd.GeoSeries.from_xy([view[0], view[1]], [view[2], view[3]], crs=3857).to_crs(4326)
+        bbox = [ll.x.min(), ll.y.min(), ll.x.max(), ll.y.max()]
+    else:
+        view, bbox = None, [68, 6, 98, 36]
+
+    for aid in sheets_pm:
+        img, ext = mosaic(aid, bbox)
+        ax.imshow(img, extent=ext, origin="upper")
+
+    if site is not None:
+        for km, c, ls, lw in ((10, "#333", "--", 1.2), (5, "#000", "--", 1.5), (2, "#000", ":", 1.8)):
+            bufs[km].plot(ax=ax, facecolor="none", edgecolor=c, linestyle=ls, linewidth=lw)
+        s.plot(ax=ax, facecolor="none", edgecolor="#000", linewidth=2)
+        ax.set_xlim(view[:2]); ax.set_ylim(view[2:])
+
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{math.degrees(x / R):.2f}°"))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{math.degrees(math.atan(math.sinh(y / R))):.2f}°"))
+    ax.set_title("Topographic MAP", fontsize=22, fontweight="bold", pad=12)
+    ax.grid(True, linestyle=":", alpha=.5)
+
+    sd = plt.subplot(gs[1]); sd.set_xlim(0, 1); sd.set_ylim(0, 1); sd.axis("off")
+    sd.add_patch(Rectangle((0, 0), 1, 1, fill=False, edgecolor="k", lw=1.5, transform=sd.transAxes))
+    sd.plot([.08, .45], [.945, .945], "k", lw=1.5)
+    for t, lab in ((.08, "0"), (.265, "1"), (.45, "2 km")):
+        sd.plot([t, t], [.945, .957], "k", lw=1.5)
+        sd.text(t, .96, lab, fontsize=8.5, fontweight="bold", ha="center", va="bottom")
+    sd.text(.8, .965, "N", fontsize=18, fontweight="bold", ha="center", va="center")
+    sd.text(.8, .93, "▲", fontsize=28, ha="center", va="center")
+    for y in (.905, .74, .545):
+        sd.plot([0, 1], [y, y], "k", lw=1)
+    sd.text(.5, .88, "Title :", fontsize=11.5, fontweight="bold", ha="center", va="center")
+    sd.text(.5, .815, "\n".join(textwrap.wrap(title.replace("\n", " "), 26)), fontsize=10,
+            ha="center", va="center", linespacing=1.2)
+    sd.text(.5, .715, "Legends", fontsize=10.5, fontweight="bold", ha="center", va="center")
+    for y, lab, ls, lw, c in ((.672, "Project Site", "-", 1.8, "k"), (.637, "Core Zone : 2 km", ":", 1.8, "k"),
+                              (.602, "Buffer Zone 5 km", "--", 1.5, "k"), (.567, "Buffer Zone 10 km", "--", 1.2, "#333")):
+        sd.add_patch(Rectangle((.08, y), .12, .022, fill=False, edgecolor=c, linestyle=ls, lw=lw))
+        sd.text(.25, y + .011, lab, fontsize=8.5, va="center")
+    if legend_bytes:
+        try:
+            li = sd.inset_axes([.005, .005, .99, .535])
+            li.imshow(Image.open(io.BytesIO(legend_bytes)), aspect="auto"); li.axis("off")
+        except Exception:
+            pass
+
+    fig.text(.15, .02, "Source : Survey of India", fontsize=12, fontweight="bold")
+    fig.text(.42, .02, f"Topo sheet No. {sheets_str}", fontsize=12, fontweight="bold")
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig); buf.seek(0)
+    return buf
+
+# ---------------- Sidebar ----------------
+st.sidebar.header("⚙️ Data Inputs")
+assets = {}
+try:
+    assets = release_assets()
+except Exception as e:
+    st.sidebar.error(f"GitHub error: {e}")
+pm_assets = {n: i for n, i in assets.items() if n.endswith(".pmtiles")}
+
+basemap = st.sidebar.selectbox("🗺️ Choose Base Map",
+                               ["OpenStreetMap", "Google Satellite", "Google Hybrid", "Google Roadmap", "Esri Satellite"])
+show_topo = st.sidebar.toggle("🗾 Show Topo Layer", value=True)
+chosen = st.sidebar.multiselect("Toposheets (PMTiles)", list(pm_assets))
+vec = st.sidebar.file_uploader("Upload Vector (.geojson, .kml, .zip)", type=["geojson", "kml", "gpx", "zip"])
+
+site = None
+if vec:
+    try:
+        site = load_vector(vec)
+        st.sidebar.caption("✅ Vectors Loaded")
+    except Exception as e:
+        st.sidebar.error(f"Vector error: {e}")
+
+sheets = [s for s in dict.fromkeys(sheet_no(n) for n in chosen) if s]
+sheets_str = ", ".join(sheets) or "56F/12, 56F/8, 56G/5, 56G/9"
+
+cfg = {"basemap": basemap, "site": None, "buffers": [],
+       "pm": [{"name": n, "url": f"http://127.0.0.1:{PROXY_PORT}/{pm_assets[n]}"} for n in chosen] if show_topo else []}
+if site is not None:
+    m3857 = site.to_crs(3857)
+    cfg["site"] = json.loads(site.to_json())
+    cfg["buffers"] = [{"km": km, "gj": json.loads(m3857.buffer(km * 1000).to_crs(4326).to_json())}
+                      for km in (10, 5, 2)]
+
+# ---------------- Page ----------------
 project_title = st.text_input(
     "Project Title",
-    value="Preliminary Assessment Study for the 14MW Solar Project at Gadgi, Bidar District, Karnataka, India"
-)
-
+    value="Preliminary Assessment Study for the 14MW Solar Project at Gadgi, Bidar District, Karnataka, India")
 st.markdown("---")
 
-# --- FOLIUM MAP SETUP ---
-m = folium.Map(location=[20.0, 78.0], zoom_start=5, tiles=None, control_scale=True)
+HTML = """
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/pmtiles@3.0.7/dist/pmtiles.js"></script>
+<div id="m" style="height:480px;border:1px solid #ccc"></div>
+<script>
+const C = __CFG__;
+const BASE = {
+ "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+ "Google Satellite": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+ "Google Hybrid": "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+ "Google Roadmap": "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
+ "Esri Satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+};
+const map = L.map('m', {preferCanvas: true, zoomSnap: 0.5}).setView([20, 78], 5);
+L.control.scale().addTo(map);
+L.tileLayer(BASE[C.basemap], {maxZoom: 20, attribution: C.basemap}).addTo(map);
+map.createPane('topo'); map.getPane('topo').style.zIndex = 300;
+let fit = L.latLngBounds([]);
+if (C.site) {
+  const sty = {10: ['#555', 2, '6,6'], 5: ['#333', 2.5, '4,4'], 2: ['#000', 2.5, '2,4']};
+  C.buffers.forEach(b => {
+    const g = L.geoJSON(b.gj, {style: {color: sty[b.km][0], weight: sty[b.km][1], dashArray: sty[b.km][2], fill: false}}).addTo(map);
+    if (b.km == 10) { fit = g.getBounds().pad(0.15); map.fitBounds(fit); }
+  });
+  L.geoJSON(C.site, {style: {color: '#000', weight: 3, fill: false}}).addTo(map);
+}
+(async () => {
+  for (const p of C.pm) {
+    try {
+      const src = new pmtiles.PMTiles(p.url);
+      const h = await src.getHeader();
+      pmtiles.leafletRasterLayer(src, {pane: 'topo', maxNativeZoom: h.maxZoom, maxZoom: 20,
+                                       opacity: 0.85, keepBuffer: 4, updateWhenZooming: false}).addTo(map);
+      if (!C.site) fit.extend([[h.minLat, h.minLon], [h.maxLat, h.maxLon]]);
+    } catch (e) { console.error(p.name, e); }
+  }
+  if (!C.site && fit.isValid()) map.fitBounds(fit);
+})();
+</script>
+"""
 
-if selected_basemap == "OpenStreetMap":
-    folium.TileLayer('OpenStreetMap').add_to(m)
-elif selected_basemap == "Google Satellite":
-    folium.TileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google Satellite').add_to(m)
-elif selected_basemap == "Google Hybrid":
-    folium.TileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', attr='Google Hybrid').add_to(m)
-elif selected_basemap == "Google Roadmap":
-    folium.TileLayer('https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', attr='Google Maps').add_to(m)
-elif selected_basemap == "Esri Satellite":
-    folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri World Imagery').add_to(m)
-
-all_bounds = []
-extracted_toposheets = []
-
-topo_layer_group = folium.FeatureGroup(name="Combined Topo Map", overlay=True, control=True)
-
-for r_name in selected_cloud_rasters:
-    sheet_no = extract_toposheet_from_filename(r_name)
-    if sheet_no and sheet_no not in extracted_toposheets:
-        extracted_toposheets.append(sheet_no)
-
-    rgb_img, bbox, _ = process_cloud_geotiff_cached(r_name, max_dim=800)
-    if rgb_img is not None:
-        all_bounds.append(bbox)
-        folium.raster_layers.ImageOverlay(
-            image=rgb_img,
-            bounds=[[bbox[1], bbox[0]], [bbox[3], bbox[2]]],
-            opacity=RASTER_OPACITY,
-            zindex=1
-        ).add_to(topo_layer_group)
-
-if uploaded_rasters:
-    for r_file in uploaded_rasters:
-        sheet_no = extract_toposheet_from_filename(r_file.name)
-        if sheet_no and sheet_no not in extracted_toposheets:
-            extracted_toposheets.append(sheet_no)
-
-        rgb_img, bbox, _ = process_local_raster(r_file, max_dim=800)
-        if rgb_img is not None:
-            all_bounds.append(bbox)
-            folium.raster_layers.ImageOverlay(
-                image=rgb_img,
-                bounds=[[bbox[1], bbox[0]], [bbox[3], bbox[2]]],
-                opacity=RASTER_OPACITY,
-                zindex=2
-            ).add_to(topo_layer_group)
-
-topo_layer_group.add_to(m)
-
-if gdf_site is not None:
-    folium.GeoJson(buf_10km, name="Buffer Zone 10 km", style_function=lambda f: {'color': '#555555', 'weight': 2.0, 'dashArray': '6, 6', 'fillOpacity': 0.0, 'fill': False}).add_to(m)
-    folium.GeoJson(buf_5km, name="Buffer Zone 5 km", style_function=lambda f: {'color': '#333333', 'weight': 2.5, 'dashArray': '4, 4', 'fillOpacity': 0.0, 'fill': False}).add_to(m)
-    folium.GeoJson(buf_2km, name="Core Zone 2 km", style_function=lambda f: {'color': '#000000', 'weight': 2.5, 'dashArray': '3, 3', 'fillOpacity': 0.0, 'fill': False}).add_to(m)
-    folium.GeoJson(gdf_site, name="Project Site", style_function=lambda f: {'color': '#000000', 'weight': 3.0, 'fillOpacity': 0.0, 'fill': False}).add_to(m)
-
-    bounds_10 = buf_10km.total_bounds
-    dx = (bounds_10[2] - bounds_10[0]) * 0.15
-    dy = (bounds_10[3] - bounds_10[1]) * 0.15
-    m.fit_bounds([[bounds_10[1] - dy, bounds_10[0] - dx], [bounds_10[3] + dy, bounds_10[2] + dx]])
-
-elif all_bounds:
-    min_x, min_y = min([b[0] for b in all_bounds]), min([b[1] for b in all_bounds])
-    max_x, max_y = max([b[2] for b in all_bounds]), max([b[3] for b in all_bounds])
-    m.fit_bounds([[min_y, min_x], [max_y, max_x]])
-
-toposheet_str = ", ".join(extracted_toposheets) if extracted_toposheets else "56F/12, 56F/8, 56G/5, 56G/9"
-
-# --- MAIN DASHBOARD MAP & LEGEND ---
-MAP_HEIGHT = 480
-
-col_map, col_legend = st.columns([3.2, 1.1])
-
+leg_bytes = legend_image(assets)
+col_map, col_leg = st.columns([3.2, 1.1])
 with col_map:
-    st_folium(m, use_container_width=True, height=MAP_HEIGHT, returned_objects=[])
-
+    components.html(HTML.replace("__CFG__", json.dumps(cfg)), height=490)
     c1, c2 = st.columns([1, 2])
-    with c1:
-        st.markdown("**Source : Survey of India**")
-    with c2:
-        st.markdown(f"**Topo sheet No. {toposheet_str}**")
-
-with col_legend:
-    legend_box = st.container(height=MAP_HEIGHT, border=True)
-    with legend_box:
+    c1.markdown("**Source : Survey of India**")
+    c2.markdown(f"**Topo sheet No. {sheets_str}**")
+with col_leg:
+    with st.container(height=480, border=True):
         st.markdown("### **Legends**")
         st.markdown("""
-        - 🔲 **Project Site**: Outline
-        - ┈┈ **Core Zone 2 km**: Dotted
-        - ╌╌ **Buffer Zone 5 km**: Dashed
-        - ╌╌ **Buffer Zone 10 km**: Fine Dashed
-        """)
-        
-        leg_path = get_legend_image_path()
-        if leg_path and os.path.exists(leg_path):
-            st.image(leg_path, caption="CONVENTIONAL SYMBOLS", use_container_width=True)
+- 🔲 **Project Site**: Outline
+- ┈┈ **Core Zone 2 km**: Dotted
+- ╌╌ **Buffer Zone 5 km**: Dashed
+- ╌╌ **Buffer Zone 10 km**: Fine Dashed
+""")
+        if leg_bytes:
+            st.image(leg_bytes, caption="CONVENTIONAL SYMBOLS", use_container_width=True)
 
 st.markdown("---")
+cl, cd, cb = st.columns([1.2, 1.5, 3])
+cl.markdown("### 📥 Export Map")
+dpi = cd.selectbox("Resolution (DPI)", [300, 600, 800], index=1, label_visibility="collapsed")
+if cb.button("🚀 Generate High-Res Map", use_container_width=True):
+    with st.spinner("Generating High-Resolution PNG..."):
+        try:
+            st.session_state["map_png"] = export_map([pm_assets[n] for n in chosen], site,
+                                                     project_title, sheets_str, dpi, leg_bytes)
+        except Exception as e:
+            st.error(f"Export failed: {e}")
+if st.session_state.get("map_png"):
+    st.download_button("⬇️ Download Ready High-Res Map (PNG)", st.session_state["map_png"],
+                       file_name="Topographic_Map_HighRes.png", mime="image/png", use_container_width=True)
 
-# --- EXPORT SECTION ---
-col_lbl, col_dpi, col_btn = st.columns([1.2, 1.5, 3])
-
-with col_lbl:
-    st.markdown("### 📥 Export Map")
-
-with col_dpi:
-    export_dpi = st.selectbox("Resolution (DPI)", [300, 600, 800], index=2, label_visibility="collapsed")
-
-with col_btn:
-    if st.button("🚀 Generate High-Res Map", use_container_width=True):
-        with st.spinner("Generating High-Resolution PNG..."):
-            st.session_state["generated_map_bytes"] = export_high_res_map(
-                selected_cloud_rasters, uploaded_rasters or [], gdf_site, buf_2km, buf_5km, buf_10km,
-                project_title, toposheet_str, dpi=export_dpi
-            )
-
-if "generated_map_bytes" in st.session_state and st.session_state["generated_map_bytes"] is not None:
-    st.download_button(
-        label="⬇️ Download Ready High-Res Map (PNG)",
-        data=st.session_state["generated_map_bytes"],
-        file_name="Topographic_Map_HighRes.png",
-        mime="image/png",
-        use_container_width=True
-    )
-
-# --- COMPACT FOOTER ---
 st.markdown("""
-    <style>
-    .custom-footer {
-        width: 100%;
-        background-color: transparent;
-        color: #888888;
-        text-align: center;
-        font-size: 10px;
-        padding: 4px 0px;
-        border-top: 1px solid #e0e0e0;
-        margin-top: 10px;
-    }
-    .custom-footer a {
-        color: #0066cc;
-        text-decoration: none;
-    }
-    .custom-footer a:hover {
-        text-decoration: underline;
-    }
-    </style>
-    <div class="custom-footer">
-        Developed by <b>Himanshu Gupta</b> &nbsp;|&nbsp; 
-        📧 <a href="mailto:himanshu.guptta.311@gmail.com">himanshu.guptta.311@gmail.com</a> &nbsp;|&nbsp; 
-        🔗 <a href="https://www.linkedin.com/in/himanshu-gupta-4a7942224" target="_blank">LinkedIn Profile</a>
-    </div>
+<div class="custom-footer">Developed by <b>Himanshu Gupta</b> &nbsp;|&nbsp;
+📧 <a href="mailto:himanshu.guptta.311@gmail.com">himanshu.guptta.311@gmail.com</a> &nbsp;|&nbsp;
+🔗 <a href="https://www.linkedin.com/in/himanshu-gupta-4a7942224" target="_blank">LinkedIn Profile</a></div>
 """, unsafe_allow_html=True)
